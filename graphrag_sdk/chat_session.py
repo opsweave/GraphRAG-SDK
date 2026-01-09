@@ -94,10 +94,10 @@ class ChatSession:
             cypher_prompt_with_history=self.cypher_prompt_with_history
         )
 
-        (context, cypher, query_execution_time) = cypher_step.run(message)
+        (context, cypher, query_execution_time, display_cypher) = cypher_step.run(message)
         self.metadata["last_query_execution_time"] = query_execution_time
         
-        return (context, cypher)
+        return (context, cypher, display_cypher)
 
     def send_message(self, message: str) -> dict:
         """
@@ -113,7 +113,7 @@ class ChatSession:
                     "context": context, 
                     "cypher": cypher}
         """
-        (context, cypher) = self._generate_cypher_query(message)
+        (context, cypher, display_cypher) = self._generate_cypher_query(message)
 
         # If the cypher is empty, return an error message
         if not cypher or len(cypher) == 0:
@@ -141,22 +141,30 @@ class ChatSession:
         
         return self.last_complete_response
     
-    def send_message_stream(self, message: str) -> Iterator[str]:
+    def send_message_stream(self, message: str, yield_objects: bool = False) -> Iterator[str | dict]:
 
         """
         Sends a message to the chat session and streams the response.
 
         Args:
             message (str): The message to send.
+            yield_objects (bool): If True, yields dict objects with 'type' and 'data' fields.
+                                 First object will be the cypher query with type='query',
+                                 subsequent objects will have type='chunk'.
 
         Yields:
-            str: Chunks of the response as they're generated.
+            str or dict: Chunks of the response as they're generated. If yield_objects is True,
+                        yields dict objects with {'type': ..., 'data': ...} format.
         """
-        (context, cypher) = self._generate_cypher_query(message)
+        (context, cypher, display_cypher) = self._generate_cypher_query(message)
 
         if not cypher or len(cypher) == 0:
             # Stream the error message for consistency with successful responses
-            yield CYPHER_ERROR_RES
+            error_chunk = CYPHER_ERROR_RES
+            if yield_objects:
+                yield {"type": "chunk", "data": error_chunk}
+            else:
+                yield error_chunk
             
             self.last_complete_response = {
                 "question": message,
@@ -166,6 +174,10 @@ class ChatSession:
             }
             return
 
+        # If object mode is enabled, first yield the cypher query
+        if yield_objects and display_cypher is not None:
+            yield {"type": "query", "data": display_cypher}
+
         qa_step = StreamingQAStep(
             chat_session=self.qa_chat_session,
             qa_prompt=self.qa_prompt,
@@ -173,7 +185,10 @@ class ChatSession:
 
         # Yield chunks of the response as they're generated
         for chunk in qa_step.run(message, cypher, context):
-            yield chunk
+            if yield_objects:
+                yield {"type": "chunk", "data": chunk}
+            else:
+                yield chunk
 
         # Set the last answer using chat history to ensure we have the complete response
         self.last_complete_response = {

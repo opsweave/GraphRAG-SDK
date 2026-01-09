@@ -7,6 +7,7 @@ from graphrag_sdk.models import (
     GenerativeModelChatSession,
 )
 from graphrag_sdk.helpers import (
+    check_falkordb_result_set_empty,
     extract_cypher,
     validate_cypher,
     stringify_falkordb_response,
@@ -51,7 +52,7 @@ class GraphQueryGenerationStep(Step):
         self.cypher_prompt = cypher_prompt
         self.cypher_prompt_with_history = cypher_prompt_with_history
 
-    def run(self, question: str, retries: Optional[int] = 10) -> tuple[Optional[str], Optional[str], Optional[int]]:
+    def run(self, question: str, retries: Optional[int] = 10) -> tuple[Optional[str], Optional[str], Optional[int], Optional[str]]:
         """
         Run the step to generate and validate a Cypher query.
         
@@ -60,26 +61,35 @@ class GraphQueryGenerationStep(Step):
             retries (Optional[int]): Number of retries allowed in case of errors.
             
         Returns:
-            tuple[Optional[str], Optional[str], Optional[int]]: The context, the generated Cypher query and the query execution time.
+            tuple[Optional[str], Optional[str], Optional[int], Optional[str]]: The context, 
+            the generated Cypher query and the query execution time in milliseconds, and the display Cypher query.
         """
         cypher = ""
+        cypher_prompt = ""
+        last_empty_query = None
         for i in range(retries):
             try:
-                cypher_prompt = (
-                    (self.cypher_prompt.format(question=question) 
-                    if self.last_answer is None
-                    else self.cypher_prompt_with_history.format(question=question, last_answer=self.last_answer))
-                )   
+                if cypher_prompt == "":
+                    cypher_prompt = (
+                        (self.cypher_prompt.format(question=question) 
+                        if self.last_answer is None
+                        else self.cypher_prompt_with_history.format(question=question, last_answer=self.last_answer))
+                    )
                 logger.debug(f"Cypher Prompt: {cypher_prompt}")
                 cypher_statement_response = self.chat_session.send_message(
                     cypher_prompt,
                 )
                 logger.debug(f"Cypher Statement Response: {cypher_statement_response}")
-                cypher = extract_cypher(cypher_statement_response.text)
-                logger.debug(f"Cypher: {cypher}")
+                result = extract_cypher(cypher_statement_response.text)
+                logger.debug(f"Cypher: {result}")
 
-                if not cypher or len(cypher) == 0:
-                    return (None, None, None)
+                if not result or "error" in result:
+                    return (None, None, None, None)
+                
+                if "context" not in result or result["context"] is None:
+                    return (None, None, None, None)
+
+                cypher = result["context"]
 
                 validation_errors = validate_cypher(cypher, self.ontology)
                 if validation_errors is not None:
@@ -89,15 +99,26 @@ class GraphQueryGenerationStep(Step):
                     query_result = self.graph.query(cypher)
                     result_set = query_result.result_set
                     execution_time = query_result.run_time_ms
+
+                    is_empty_result = check_falkordb_result_set_empty(result_set)
+                    if is_empty_result and cypher != last_empty_query:
+                        logger.debug("Cypher query returned empty result set, retrying...")
+                        last_empty_query = cypher
+                        cypher_prompt = f"The generated Cypher query returned an empty result set. If you are absolutely sure there is another way to formulate the query based on the ontology to answer the question, please try again. Otherwise, return the same Cypher query. The question to answer is: {question}"
+                        continue
+                    
                     context = stringify_falkordb_response(result_set)
                     logger.debug(f"Context: {context}")
                     logger.debug(f"Context size: {len(result_set)}")
                     logger.debug(f"Context characters: {len(str(context))}")
 
-                    return (context, cypher, execution_time)
+                    return (context, cypher, execution_time, result["display"] if "display" in result else None)
             except Exception as e:
-                logger.debug(f"Error: {e}")
+                logger.error(f"Error: {e}")
                 error = e
-                self.chat_session.delete_last_message()
+                if "litellm.RateLimitError" in str(e):
+                    self.chat_session.delete_last_message()
+                    continue
+                cypher_prompt = f"The previous Cypher query you generated resulted in the following error: {str(e)}. Please generate a new Cypher query that adheres to the ontology and avoids this error. The question to answer is: {question}"
 
         raise Exception("Failed to generate Cypher query: " + str(error))

@@ -1,5 +1,6 @@
 import re
 import logging
+import json
 from typing import Union, Optional, TYPE_CHECKING
 from fix_busted_json import repair_json
 
@@ -114,8 +115,28 @@ def stringify_falkordb_response(response: Union[list, str]) -> str:
 
     return data
 
+def check_falkordb_result_set_empty(result_set: list[str]) -> bool:
+    """
+    Checks if FalkorDB result set is empty.
+    
+    Args:
+        result_set (list[str]): The result set to check.
+    Returns:
+        bool: True if the result set is empty, False otherwise.
+    """
+    if not isinstance(result_set, list) or len(result_set) == 0:
+        return True
+    elif not isinstance(result_set[0], list):
+        return False
+    else:
+        for row in result_set:
+            if len(row) > 0:
+                if row[0] is not None and (row[0] == '0' or row[0] == 0):
+                    return True
+                return False
+        return True
 
-def extract_cypher(text: str) -> str:
+def extract_cypher(text: str) -> dict[str, str] | None:
     """
     Extracts Cypher query from a text block.
     
@@ -127,13 +148,19 @@ def extract_cypher(text: str) -> str:
     """
 
     if not text.startswith("```"):
-        return text
+        return None
 
     regex = r"```(?:cypher)?(.*?)```"
     matches = re.findall(regex, text, re.DOTALL)
 
-    return "".join(matches)
+    jsonStr = "".join(matches)
 
+    # jsonStr should be a JSON string containing {"context": "...", "display": "..."} or {"error": "..."}
+    try:
+        cypher_dict = json.loads(jsonStr)
+        return cypher_dict
+    except Exception as e:
+        raise Exception(f"Failed to parse Cypher JSON: {e} - {jsonStr}\nExpected format: ```{{\"context\": \"...\", \"display\": \"...\"}}``` or ```{{\"error\": \"...\"}}```")
 
 def validate_cypher(
     cypher: str, ontology: "Ontology"
@@ -161,7 +188,8 @@ def validate_cypher(
         errors.extend(validate_cypher_relations_exist(cypher, ontology))
 
         # Check if relation directions are correct
-        errors.extend(validate_cypher_relation_directions(cypher, ontology))
+        # TODO: fix errors. doesn't support nodes without labels yet
+        # errors.extend(validate_cypher_relation_directions(cypher, ontology))
 
         if len(errors) > 0:
             return errors
